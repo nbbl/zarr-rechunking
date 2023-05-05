@@ -1,23 +1,42 @@
+use clap::Parser;
 use json::JsonValue;
 use std::path::{Path, PathBuf};
-use std::{env, fs, io, usize};
+use std::{fs, io, usize};
 use thiserror::Error;
+
+#[derive(Parser, Debug)]
+struct Args {
+    #[arg(short, long)]
+    root: String,
+
+    #[arg(short, long)]
+    array: String,
+
+    #[arg(short, long)]
+    output: String,
+}
 
 #[derive(Error, Debug)]
 enum RechunkingError {
     // TODO: different error types (metadata, chunks, ...)?
     #[error("TODO")]
     IncompatibleZarrVersion,
+
     #[error("TODO")]
     IncompatibleChunkSize,
+
     #[error("TODO")]
     IncompatibleArrayShape,
+
     #[error("TODO")]
     InvalidJSON,
+
     #[error("TODO")]
     InvalidChunkFiles,
+
     #[error("TODO")]
     InvalidArgError,
+
     #[error(transparent)]
     IoError(#[from] std::io::Error),
 }
@@ -28,9 +47,10 @@ struct Metadata {
     shape: usize,
 }
 
-fn parse_zarray(json_file: &Path) -> Result<Metadata, RechunkingError> {
-    let json =
-        json::parse(&fs::read_to_string(json_file)?).map_err(|_| RechunkingError::InvalidJSON)?;
+fn parse_zarray(in_dir: &Path) -> Result<Metadata, RechunkingError> {
+    let zarray_file = in_dir.join(".zarray");
+    let json = json::parse(&fs::read_to_string(zarray_file.as_path())?)
+        .map_err(|_| RechunkingError::InvalidJSON)?;
     if json["zarr_format"] != 2 {
         return Err(RechunkingError::IncompatibleZarrVersion);
     }
@@ -46,7 +66,7 @@ fn parse_zarray(json_file: &Path) -> Result<Metadata, RechunkingError> {
     Ok(Metadata { json, shape })
 }
 
-fn collect_chunk_files(chunks_dir: &Path, shape: usize) -> Result<Vec<PathBuf>, RechunkingError> {
+fn collect_chunks(chunks_dir: &Path, shape: usize) -> Result<Vec<PathBuf>, RechunkingError> {
     // TODO: Return Path or PathBuf?
     // TODO: Should unexpected files in dir result in error too?
     let mut chunks = fs::read_dir(chunks_dir)?
@@ -101,24 +121,31 @@ fn write_chunk(out_path: &Path, arr_buf: Vec<u8>) -> io::Result<()> {
     fs::write(out_path.join("0"), arr_buf)
 }
 
+fn adjust_metadata(in_data: JsonValue, chunk_size: usize) -> JsonValue {
+    let mut out = in_data;
+    out["chunks"] = json::array![chunk_size];
+    out
+}
+
+fn write_zarray(out_path: &Path, data: JsonValue) -> io::Result<()> {
+    fs::write(out_path.join(".zarray"), json::stringify_pretty(data, 4))
+}
+
 fn main() -> Result<(), RechunkingError> {
-    let args: Vec<String> = env::args().collect();
-    // TODO: Check for args len, display help when args are invalid.
-    // TODO: Check whether path is valid
-    let in_dir = Path::new(&args[1]);
+    let args = Args::parse();
+    // TODO: Check whether args are valid
+    let in_dir = Path::new(&args.array);
+    let metadata = parse_zarray(in_dir)?;
+    println!("Array shape: {:?}", metadata.shape);
     // TODO: Check that arg for out_dir is single component, not path.
-    let shape = parse_zarray(in_dir.join(".zarray").as_path())?.shape;
-    println!("Array shape: {:?}", shape);
     let out_dir = in_dir
         .parent()
         .ok_or(RechunkingError::InvalidArgError)?
-        .join(&args[2]);
-    // TODO: Get shape from .zarray
-    let shape = args[3]
-        .parse::<usize>()
-        .map_err(|_| RechunkingError::InvalidArgError)?;
-    let chunks = collect_chunk_files(in_dir, shape)?;
+        .join(&args.output);
+    let chunks = collect_chunks(in_dir, metadata.shape)?;
+    let num_chunks = chunks.len();
     write_chunk(&out_dir, concat_chunks(chunks))?;
-    // write_zarray(&out_dir, adjust_metadata());
+    // TODO: Copy .zattrs too.
+    write_zarray(&out_dir, adjust_metadata(metadata.json, num_chunks))?;
     Ok(())
 }
