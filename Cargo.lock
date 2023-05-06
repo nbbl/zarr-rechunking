@@ -73,6 +73,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
+name = "blosc"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5aa4be3ff6a15133256bcb58bdc8fefd074aebece453605386646bb96db0dc57"
+dependencies = [
+ "blosc-sys",
+ "libc",
+]
+
+[[package]]
+name = "blosc-sys"
+version = "1.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5cb47d18e3b7382569d8ee19671514a1633b9ddcfbd8b87d4708bdf5c0a90bc8"
+
+[[package]]
 name = "cc"
 version = "1.0.79"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -497,6 +513,7 @@ checksum = "1a515f5799fe4961cb532f983ce2b23082366b898e52ffbce459c86f67c8378a"
 name = "zarr-rechunking"
 version = "0.1.0"
 dependencies = [
+ "blosc",
  "clap",
  "glob",
  "json",

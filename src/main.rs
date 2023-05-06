@@ -112,13 +112,12 @@ fn collect_chunks(chunks_dir: &Path, shape: usize) -> Result<Vec<PathBuf>, Rechu
 }
 
 fn concat_chunks(paths: Vec<PathBuf>) -> Vec<u8> {
-    // TODO: Implement decompression
     // TODO: Implement parallel processing
     // TODO: Error handling in this function?
     paths
         .iter()
         .flat_map(|p| fs::read(p.as_path()))
-        .flatten()
+        .flat_map(|b| unsafe { blosc::decompress_bytes::<u8>(&b[..]) }.unwrap_or(vec![]))
         .collect()
 }
 
