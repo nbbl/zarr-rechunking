@@ -1,5 +1,6 @@
 use clap::Parser;
 use json::JsonValue;
+use rayon::prelude::*;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
@@ -47,7 +48,7 @@ enum RechunkingError {
 }
 
 struct Metadata {
-    // TODO: Add compression options
+    // TODO: Add compression option: Option<Blosc>
     json: JsonValue,
     shape: usize,
 }
@@ -71,61 +72,8 @@ fn parse_zarray(in_dir: &Path) -> Result<Metadata, RechunkingError> {
     let shape = s
         .as_usize()
         .ok_or(RechunkingError::IncompatibleArrayShape)?;
+    // TODO: Parse compression option
     Ok(Metadata { json, shape })
-}
-
-fn collect_chunks(chunks_dir: &Path, shape: usize) -> Result<Vec<PathBuf>, RechunkingError> {
-    // TODO: Return Path or PathBuf?
-    // TODO: Should unexpected files in dir result in error too?
-    let mut chunks = fs::read_dir(chunks_dir)?
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            let idx = path
-                .file_name()?
-                .to_str()?
-                .to_string()
-                .parse::<usize>()
-                .ok()?;
-            if !path.is_file() {
-                return None;
-            }
-            Some((idx, path))
-        })
-        .collect::<Vec<(usize, PathBuf)>>();
-
-    let num_chunks = chunks.len();
-    if num_chunks > shape {
-        // TODO: error msg: found too many chunks for given shape
-        return Err(RechunkingError::InvalidChunkFiles);
-    }
-
-    chunks.sort_by_key(|p| p.0);
-
-    let (idxs, paths): (Vec<usize>, Vec<PathBuf>) = chunks.into_iter().unzip();
-
-    if !idxs.into_iter().eq(0..num_chunks) {
-        // TODO: error msg: chunks indices are not consecutive
-        return Err(RechunkingError::InvalidChunkFiles);
-    }
-
-    Ok(paths)
-}
-
-fn concat_chunks(paths: Vec<PathBuf>) -> Vec<u8> {
-    // TODO: Implement parallel processing
-    // TODO: Error handling in this function?
-    paths
-        .iter()
-        .flat_map(|p| fs::read(p.as_path()))
-        .flat_map(|b| unsafe { blosc::decompress_bytes::<u8>(&b[..]) }.unwrap_or(vec![]))
-        .collect()
-}
-
-fn write_chunk(out_path: &Path, arr_buf: Vec<u8>) -> io::Result<()> {
-    // TODO: Handle errors (out_path exist, cannot be created)
-    fs::create_dir(out_path)?;
-    // TODO: Implement compression.
-    fs::write(out_path.join("0"), arr_buf)
 }
 
 fn adjust_zarray(in_data: JsonValue, chunk_size: usize) -> JsonValue {
@@ -183,12 +131,71 @@ fn write_metadata(
     Ok(())
 }
 
+fn collect_chunks(chunks_dir: &Path, shape: usize) -> Result<Vec<PathBuf>, RechunkingError> {
+    // TODO: Return Path or PathBuf?
+    // TODO: Should unexpected files in dir result in error too?
+    let mut chunks = fs::read_dir(chunks_dir)?
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let idx = path
+                .file_name()?
+                .to_str()?
+                .to_string()
+                .parse::<usize>()
+                .ok()?;
+            if !path.is_file() {
+                return None;
+            }
+            Some((idx, path))
+        })
+        .collect::<Vec<(usize, PathBuf)>>();
+
+    let num_chunks = chunks.len();
+    if num_chunks > shape {
+        // TODO: error msg: found too many chunks for given shape
+        return Err(RechunkingError::InvalidChunkFiles);
+    }
+
+    chunks.sort_by_key(|p| p.0);
+
+    let (idxs, paths): (Vec<usize>, Vec<PathBuf>) = chunks.into_iter().unzip();
+
+    if !idxs.into_iter().eq(0..num_chunks) {
+        // TODO: error msg: chunks indices are not consecutive
+        return Err(RechunkingError::InvalidChunkFiles);
+    }
+
+    Ok(paths)
+}
+
+fn concat_chunks(paths: Vec<PathBuf>) -> Vec<u8> {
+    // TODO: Error handling in this function?
+    // TODO: Only use decompression when given by arg!!
+    paths
+        .par_iter()
+        .flat_map(|p| fs::read(p.as_path()))
+        .flat_map(|b| unsafe { blosc::decompress_bytes::<u8>(&b[..]) }.unwrap_or(vec![]))
+        .collect()
+}
+
+fn write_chunk(out_path: &Path, arr_buf: Vec<u8>) -> io::Result<()> {
+    // TODO: Handle errors (out_path exist, cannot be created)
+    fs::create_dir(out_path)?;
+    // TODO: Implement compression.
+    fs::write(out_path.join("0"), arr_buf)
+}
+
 fn is_normal_comp(path: &Path) -> bool {
     let comps: Vec<Component> = path.components().collect();
     comps.len() == 1 && comps.iter().all(|c| matches!(c, Component::Normal { .. }))
 }
 
 fn main() -> Result<(), RechunkingError> {
+    // TODO: Documentation:
+    // * functions
+    // * cli parameters
+    // * help message
+    // * README.md
     let args = Args::parse();
     // TODO: Move args checks into separate fn?
     let top_dir = Path::new(&args.top);
