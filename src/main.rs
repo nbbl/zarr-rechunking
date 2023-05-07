@@ -20,7 +20,6 @@ struct Args {
     output: String,
 }
 
-// TODO: Use anyhow (sic!) crate instead?
 #[derive(Error, Debug)]
 enum RechunkingError {
     #[error("{0} is not a valid JSON file")]
@@ -34,6 +33,9 @@ enum RechunkingError {
 
     #[error("Invalid argument command line argument passed: {0}")]
     InvalidArgError(&'static str),
+
+    #[error("Decompression failed")]
+    DecompressionError,
 
     #[error(transparent)]
     IoError(#[from] std::io::Error),
@@ -186,15 +188,16 @@ fn collect_chunks(chunks_dir: &Path, shape: usize) -> Result<Vec<PathBuf>, Rechu
     Ok(paths)
 }
 
-fn concat_chunks(paths: Vec<PathBuf>) -> Vec<u8> {
-    // TODO: Error handling in this function?
+fn concat_chunks(paths: Vec<PathBuf>) -> Result<Vec<u8>, RechunkingError> {
     // TODO: Only use decompression when given by arg!!
-    paths
+    let buffers = paths
         .par_iter()
         .flat_map(|p| fs::read(p.as_path()))
-        // TODO: Handle error instead of returning empty vec!!
-        .flat_map(|b| unsafe { blosc::decompress_bytes::<u8>(&b[..]) }.unwrap_or(vec![]))
-        .collect()
+        .map(|b| Ok::<Vec<u8>, ()>(unsafe { blosc::decompress_bytes::<u8>(&b[..])? }))
+        .collect::<Result<Vec<Vec<u8>>, ()>>()
+        .map_err(|_| RechunkingError::DecompressionError)?;
+
+    Ok(buffers.into_par_iter().flatten().collect())
 }
 
 fn write_chunk(out_path: &Path, arr_buf: Vec<u8>) -> io::Result<()> {
@@ -236,7 +239,7 @@ fn main() -> Result<()> {
     let metadata = parse_zarray(&in_dir)?;
     let chunks = collect_chunks(&in_dir, metadata.shape)?;
     let num_chunks = chunks.len();
-    write_chunk(&out_dir, concat_chunks(chunks))?;
+    write_chunk(&out_dir, concat_chunks(chunks)?)?;
     write_metadata(
         top_dir,
         rel_in_dir,
