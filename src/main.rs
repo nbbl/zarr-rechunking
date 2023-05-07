@@ -3,7 +3,7 @@ use clap::Parser;
 use json::JsonValue;
 use rayon::prelude::*;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::usize;
 use thiserror::Error;
@@ -47,7 +47,7 @@ struct Metadata {
     shape: usize,
 }
 
-fn parse_zarray(in_dir: &Path) -> Result<Metadata, RechunkingError> {
+fn parse_zarray(in_dir: &Path) -> Result<Metadata> {
     let zarray_file = in_dir.join(".zarray");
     let zarray_file_str = zarray_file.to_string_lossy().to_string();
     let json = json::parse(&fs::read_to_string(zarray_file.as_path())?)
@@ -57,27 +57,28 @@ fn parse_zarray(in_dir: &Path) -> Result<Metadata, RechunkingError> {
         return Err(RechunkingError::InvalidMetadataFile(
             zarray_file_str,
             "missing, incompabtible or invalid zarr_format value",
-        ));
+        )
+        .into());
     }
 
     if !json.has_key("chunks") || json["chunks"].members().as_slice() != [1] {
         return Err(RechunkingError::InvalidMetadataFile(
             zarray_file_str,
             "missing, incompatible or invalid chunks value, must be [1]",
-        ));
+        )
+        .into());
     }
 
     if !json.has_key("shape") {
-        return Err(RechunkingError::InvalidMetadataFile(
-            zarray_file_str,
-            "missing shape value",
-        ));
+        return Err(
+            RechunkingError::InvalidMetadataFile(zarray_file_str, "missing shape value").into(),
+        );
     }
     let [s] =  json["shape"].members().as_slice() else {
         return Err(RechunkingError::InvalidMetadataFile(
             zarray_file_str,
             "incompatible or invalid shape value, must be one-dimensional",
-        ));
+        ).into());
     };
 
     let shape = s.as_usize().ok_or(RechunkingError::InvalidMetadataFile(
@@ -100,7 +101,7 @@ fn write_metadata(
     rel_in_dir: &Path,
     rel_out_dir: &Path,
     out_data: JsonValue,
-) -> Result<(), RechunkingError> {
+) -> Result<()> {
     let out_zarray = rel_out_dir.join(".zarray");
     let out_zattrs = rel_out_dir.join(".zattrs");
     let in_zattrs = rel_in_dir.join(".zattrs");
@@ -114,7 +115,8 @@ fn write_metadata(
             return Err(RechunkingError::InvalidMetadataFile(
                 zmetadata_str,
                 "metadata value is missing",
-            ));
+            )
+            .into());
         }
 
         let metadata = &mut top_json["metadata"];
@@ -147,7 +149,7 @@ fn write_metadata(
     Ok(())
 }
 
-fn collect_chunks(chunks_dir: &Path, shape: usize) -> Result<Vec<PathBuf>, RechunkingError> {
+fn collect_chunks(chunks_dir: &Path, shape: usize) -> Result<Vec<PathBuf>> {
     // TODO: Return Path or PathBuf?
     let chunks_dir_str = chunks_dir.to_string_lossy().to_string();
     let mut chunks = fs::read_dir(chunks_dir)?
@@ -171,7 +173,8 @@ fn collect_chunks(chunks_dir: &Path, shape: usize) -> Result<Vec<PathBuf>, Rechu
         return Err(RechunkingError::InvalidChunkFiles(
             chunks_dir_str,
             "found too many chunks for given shape",
-        ));
+        )
+        .into());
     }
 
     chunks.sort_by_key(|p| p.0);
@@ -182,13 +185,14 @@ fn collect_chunks(chunks_dir: &Path, shape: usize) -> Result<Vec<PathBuf>, Rechu
         return Err(RechunkingError::InvalidChunkFiles(
             chunks_dir_str,
             "chunk files do not form consecutive sequence 0..num_chunks",
-        ));
+        )
+        .into());
     }
 
     Ok(paths)
 }
 
-fn concat_chunks(paths: Vec<PathBuf>) -> Result<Vec<u8>, RechunkingError> {
+fn concat_chunks(paths: Vec<PathBuf>) -> Result<Vec<u8>> {
     // TODO: Only use decompression when given by arg!!
     let buffers = paths
         .par_iter()
@@ -200,11 +204,11 @@ fn concat_chunks(paths: Vec<PathBuf>) -> Result<Vec<u8>, RechunkingError> {
     Ok(buffers.into_par_iter().flatten().collect())
 }
 
-fn write_chunk(out_path: &Path, arr_buf: Vec<u8>) -> io::Result<()> {
+fn write_chunk(out_path: &Path, arr_buf: Vec<u8>) -> Result<()> {
     // TODO: Handle errors (out_path exist, cannot be created)
     fs::create_dir(out_path)?;
     // TODO: Implement compression.
-    fs::write(out_path.join("0"), arr_buf)
+    Ok(fs::write(out_path.join("0"), arr_buf)?)
 }
 
 fn is_normal_comp(path: &Path) -> bool {
