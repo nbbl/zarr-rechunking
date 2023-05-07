@@ -1,4 +1,5 @@
 use anyhow::Result;
+use blosc::{Clevel, Compressor, Context, ShuffleMode};
 use clap::Parser;
 use json::JsonValue;
 use rayon::prelude::*;
@@ -42,9 +43,9 @@ enum RechunkingError {
 }
 
 struct Metadata {
-    // TODO: Add compression option: Option<Blosc>
     json: JsonValue,
     shape: usize,
+    is_compressed: bool,
 }
 
 fn parse_zarray(in_dir: &Path) -> Result<Metadata> {
@@ -80,13 +81,45 @@ fn parse_zarray(in_dir: &Path) -> Result<Metadata> {
             "incompatible or invalid shape value, must be one-dimensional",
         ).into());
     };
-
     let shape = s.as_usize().ok_or(RechunkingError::InvalidMetadataFile(
-        zarray_file_str,
+        zarray_file_str.clone(),
         "shape value is not a valid dimension",
     ))?;
-    // TODO: Parse compression option
-    Ok(Metadata { json, shape })
+
+    if !json.has_key("compressor") {
+        return Err(RechunkingError::InvalidMetadataFile(
+            zarray_file_str,
+            "missing compressor value",
+        )
+        .into());
+    }
+    let compressor = &json["compressor"];
+    let is_compressed = if compressor.is_null() {
+        false
+    } else {
+        if !compressor.has_key("id") {
+            return Err(RechunkingError::InvalidMetadataFile(
+                zarray_file_str,
+                "compressor id is not specified",
+            )
+            .into());
+        }
+        if compressor["id"] != "blosc" {
+            return Err(RechunkingError::InvalidMetadataFile(
+                zarray_file_str,
+                "only Blosc compressor is supported",
+            )
+            .into());
+        }
+        // NOTE: compressor options are not validated in detail
+        true
+    };
+
+    Ok(Metadata {
+        json,
+        shape,
+        is_compressed,
+    })
 }
 
 fn adjust_zarray(in_data: JsonValue, chunk_size: usize) -> JsonValue {
@@ -192,12 +225,17 @@ fn collect_chunks(chunks_dir: &Path, shape: usize) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn concat_chunks(paths: Vec<PathBuf>) -> Result<Vec<u8>> {
-    // TODO: Only use decompression when given by arg!!
+fn concat_chunks(paths: Vec<PathBuf>, is_compressed: bool) -> Result<Vec<u8>> {
+    let decompressor = if is_compressed {
+        |b: Vec<u8>| Ok::<Vec<u8>, ()>(unsafe { blosc::decompress_bytes::<u8>(&b[..])? })
+    } else {
+        Ok
+    };
+
     let buffers = paths
         .par_iter()
         .flat_map(|p| fs::read(p.as_path()))
-        .map(|b| Ok::<Vec<u8>, ()>(unsafe { blosc::decompress_bytes::<u8>(&b[..])? }))
+        .map(decompressor)
         .collect::<Result<Vec<Vec<u8>>, ()>>()
         .map_err(|_| RechunkingError::DecompressionError)?;
 
@@ -207,8 +245,18 @@ fn concat_chunks(paths: Vec<PathBuf>) -> Result<Vec<u8>> {
 fn write_chunk(out_path: &Path, arr_buf: Vec<u8>) -> Result<()> {
     // TODO: Handle errors (out_path exist, cannot be created)
     fs::create_dir(out_path)?;
-    // TODO: Implement compression.
-    Ok(fs::write(out_path.join("0"), arr_buf)?)
+
+    let context = Context::new()
+        .blocksize(None)
+        .compressor(Compressor::LZ4)
+        .unwrap()
+        .clevel(Clevel::L5)
+        .shuffle(ShuffleMode::Byte);
+
+    // TODO: Check why compression has practically no effect on merged chunk filesize
+    let compressed = context.compress(&arr_buf[..]);
+
+    Ok(fs::write(out_path.join("0"), compressed)?)
 }
 
 fn is_normal_comp(path: &Path) -> bool {
@@ -243,7 +291,7 @@ fn main() -> Result<()> {
     let metadata = parse_zarray(&in_dir)?;
     let chunks = collect_chunks(&in_dir, metadata.shape)?;
     let num_chunks = chunks.len();
-    write_chunk(&out_dir, concat_chunks(chunks)?)?;
+    write_chunk(&out_dir, concat_chunks(chunks, metadata.is_compressed)?)?;
     write_metadata(
         top_dir,
         rel_in_dir,
