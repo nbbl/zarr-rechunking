@@ -403,9 +403,6 @@ fn is_subpath(path: &Path) -> bool {
 }
 
 fn main() -> Result<()> {
-    // TODO: Documentation:
-    // * README.md
-
     let args = Args::parse();
 
     let top_dir = Path::new(&args.top);
