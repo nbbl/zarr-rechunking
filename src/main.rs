@@ -1,7 +1,9 @@
 use anyhow::Result;
 use blosc::{Clevel, Compressor, Context, ShuffleMode};
 use clap::Parser;
-use json::JsonValue;
+use json::JsonValue::Null;
+use json::{object, JsonValue};
+use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -32,13 +34,13 @@ enum RechunkingError {
     #[error("Invalid chunk files in folder {0}: {1}")]
     InvalidChunkFiles(String, &'static str),
 
-    #[error("Invalid argument command line argument passed: {0}")]
+    #[error("Invalid command line argument passed: {0}")]
     InvalidArgError(&'static str),
 
     #[error("Decompression failed")]
     DecompressionError,
 
-    #[error(transparent)]
+    #[error("Writing to output failed: {0}")]
     IoError(#[from] std::io::Error),
 }
 
@@ -47,6 +49,38 @@ struct Metadata {
     shape: usize,
     is_compressed: bool,
 }
+
+/// Compression context for compression of result chunk
+/// corresponds to COMPRESSION_OPTIONS
+static COMPRESSION_CONTEXT: Lazy<Context> = Lazy::new(|| {
+    Context::new()
+        // Automatic determination of block size
+        .blocksize(None)
+        // Name of compression algorithm
+        .compressor(Compressor::LZ4)
+        .unwrap()
+        // Compression level
+        .clevel(Clevel::L5)
+        // Shuffle (filtering) mode
+        .shuffle(ShuffleMode::Byte)
+});
+
+/// JSON object representing the used compression options in the result .zarray
+/// corresponds to COMPRESSION_CONTEXT
+static COMPRESSION_OPTIONS: Lazy<JsonValue> = Lazy::new(|| {
+    object! {
+        // Automatic determination of block size
+        blocksize: 0,
+        // Compression level
+        clevel: 5,
+        // Name of compression algorithm
+        cname: "lz4",
+        // Name of primary compressor (wrapper)
+        id: "blosc",
+        // Shuffle (filtering) mode, is byte shuffle
+        shuffle: 1
+    }
+});
 
 fn parse_zarray(in_dir: &Path) -> Result<Metadata> {
     let zarray_file = in_dir.join(".zarray");
@@ -115,6 +149,15 @@ fn parse_zarray(in_dir: &Path) -> Result<Metadata> {
         true
     };
 
+    if !json.has_key("filters") || json["filter"] != Null {
+        return Err(RechunkingError::InvalidMetadataFile(
+            zarray_file_str,
+            "missing, incompatible or invalid filter value.\n
+            Filter must be null, filtering is only supported as part of compressor",
+        )
+        .into());
+    }
+
     Ok(Metadata {
         json,
         shape,
@@ -125,7 +168,7 @@ fn parse_zarray(in_dir: &Path) -> Result<Metadata> {
 fn adjust_zarray(in_data: JsonValue, chunk_size: usize) -> JsonValue {
     let mut out = in_data;
     out["chunks"] = json::array![chunk_size];
-    // TODO: Adapt compression options
+    out["compressor"] = COMPRESSION_OPTIONS.clone();
     out
 }
 
@@ -202,10 +245,16 @@ fn collect_chunks(chunks_dir: &Path, shape: usize) -> Result<Vec<PathBuf>> {
         .collect::<Vec<(usize, PathBuf)>>();
 
     let num_chunks = chunks.len();
+    if num_chunks == 0 {
+        return Err(
+            RechunkingError::InvalidChunkFiles(chunks_dir_str, "no chunk files found").into(),
+        );
+    }
+
     if num_chunks > shape {
         return Err(RechunkingError::InvalidChunkFiles(
             chunks_dir_str,
-            "found too many chunks for given shape",
+            "found too many chunks files for given shape",
         )
         .into());
     }
@@ -244,17 +293,10 @@ fn concat_chunks(paths: Vec<PathBuf>, is_compressed: bool) -> Result<Vec<u8>> {
 
 fn write_chunk(out_path: &Path, arr_buf: Vec<u8>) -> Result<()> {
     // TODO: Handle errors (out_path exist, cannot be created)
-    fs::create_dir(out_path)?;
-
-    let context = Context::new()
-        .blocksize(None)
-        .compressor(Compressor::LZ4)
-        .unwrap()
-        .clevel(Clevel::L5)
-        .shuffle(ShuffleMode::Byte);
+    fs::create_dir(out_path).map_err(RechunkingError::IoError)?;
 
     // TODO: Check why compression has practically no effect on merged chunk filesize
-    let compressed = context.compress(&arr_buf[..]);
+    let compressed = COMPRESSION_CONTEXT.compress(&arr_buf[..]);
 
     Ok(fs::write(out_path.join("0"), compressed)?)
 }
@@ -273,13 +315,15 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let top_dir = Path::new(&args.top);
     if !top_dir.is_dir() {
-        return Err(RechunkingError::InvalidArgError("<TOP> must be existing dir.").into());
+        return Err(RechunkingError::InvalidArgError("<TOP> must be an existing dir.").into());
     }
     // TODO: Check that rel_in_dir has only normal components and separators (no root, ..)
     let rel_in_dir = Path::new(&args.array);
     let in_dir = top_dir.join(rel_in_dir);
     if !in_dir.is_dir() {
-        return Err(RechunkingError::InvalidArgError("<TOP>/<ARRAY> must be existing dir").into());
+        return Err(
+            RechunkingError::InvalidArgError("<TOP>/<ARRAY> must be an existing dir").into(),
+        );
     }
     let out_comp = Path::new(&args.output);
     if !is_normal_comp(out_comp) {
@@ -287,7 +331,12 @@ fn main() -> Result<()> {
     }
     let rel_out_dir = rel_in_dir.parent().unwrap().join(out_comp);
     let out_dir = top_dir.join(rel_out_dir.clone());
-    // TODO: Handle case that out_dir exits or is equal to array_dir (forbid overwriting?!)
+    if out_dir.exists() {
+        return Err(RechunkingError::InvalidArgError(
+            "output dir exists, but overwriting is not implemented",
+        )
+        .into());
+    }
     let metadata = parse_zarray(&in_dir)?;
     let chunks = collect_chunks(&in_dir, metadata.shape)?;
     let num_chunks = chunks.len();
