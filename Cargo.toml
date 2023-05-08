@@ -1,7 +1,9 @@
 [package]
+authors = ["Johannes Sauer <jtsauer@gmail.com>"]
 name = "zarr-rechunking"
 version = "0.1.0"
 edition = "2021"
+description = "Merges chunks of one dimensional Zarr arrays"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

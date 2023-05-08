@@ -6,20 +6,27 @@ use json::{object, JsonValue};
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Error, Write};
 use std::path::{Component, Path, PathBuf};
 use std::usize;
 use thiserror::Error;
 
 #[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
 struct Args {
+    /// The top level directory under which <ARRAY> must be placed
     #[arg(short, long)]
     top: String,
 
-    #[arg(short, long)]
+    /// Directory with input array (chunk files, .zarray, optionally .zattrs),
+    /// the provided path will be interpreted as subpath of <TOP>
+    #[arg(short, long, verbatim_doc_comment)]
     array: String,
 
-    #[arg(short, long)]
+    /// Single component output directory for rechunked array,
+    /// the provided path must be a single component.
+    /// Output will be created under parent of <TOP>/<ARRAY>
+    #[arg(short, long, verbatim_doc_comment)]
     output: String,
 }
 
@@ -40,17 +47,22 @@ enum RechunkingError {
     #[error("Decompression failed")]
     DecompressionError,
 
-    #[error("Writing to output failed: {0}")]
-    IoError(#[from] std::io::Error),
+    #[error("Read or write failed: {0}")]
+    IoError(String),
 }
 
+/// Metadata parsed from .zarray file
 struct Metadata {
+    // .zarray parsed to JSON
     json: JsonValue,
+    // Shape of array
     shape: usize,
+    // Whether chunks are compressed
     is_compressed: bool,
 }
 
 /// Compression context for compression of result chunk
+/// 
 /// corresponds to COMPRESSION_OPTIONS
 static COMPRESSION_CONTEXT: Lazy<Context> = Lazy::new(|| {
     Context::new()
@@ -66,6 +78,7 @@ static COMPRESSION_CONTEXT: Lazy<Context> = Lazy::new(|| {
 });
 
 /// JSON object representing the used compression options in the result .zarray
+/// 
 /// corresponds to COMPRESSION_CONTEXT
 static COMPRESSION_OPTIONS: Lazy<JsonValue> = Lazy::new(|| {
     object! {
@@ -82,10 +95,20 @@ static COMPRESSION_OPTIONS: Lazy<JsonValue> = Lazy::new(|| {
     }
 });
 
+/// Parse the metadata file at `in_dir`/.zarray
+///
+/// An error is returned if the file cannot be read,
+/// JSON is not valid,
+/// or metadata is incompatible with rechunking
+/// Note that compressor options are not checked in detail!
 fn parse_zarray(in_dir: &Path) -> Result<Metadata> {
     let zarray_file = in_dir.join(".zarray");
     let zarray_file_str = zarray_file.to_string_lossy().to_string();
-    let json = json::parse(&fs::read_to_string(zarray_file.as_path())?)
+    let err_map = |_: Error| {
+        RechunkingError::IoError(format!("File at {} could not be read", zarray_file_str))
+    };
+    let file_str = fs::read_to_string(zarray_file.as_path()).map_err(err_map)?;
+    let json = json::parse(&file_str)
         .map_err(|_| RechunkingError::InvalidJSON(zarray_file_str.clone()))?;
 
     if !json.has_key("zarr_format") || json["zarr_format"] != 2 {
@@ -145,7 +168,6 @@ fn parse_zarray(in_dir: &Path) -> Result<Metadata> {
             )
             .into());
         }
-        // NOTE: compressor options are not validated in detail
         true
     };
 
@@ -165,6 +187,7 @@ fn parse_zarray(in_dir: &Path) -> Result<Metadata> {
     })
 }
 
+/// Adjust the JSON for the output .zarray
 fn adjust_zarray(in_data: JsonValue, chunk_size: usize) -> JsonValue {
     let mut out = in_data;
     out["chunks"] = json::array![chunk_size];
@@ -172,6 +195,9 @@ fn adjust_zarray(in_data: JsonValue, chunk_size: usize) -> JsonValue {
     out
 }
 
+/// Adjust and rewrite .zmetadata if it exists,
+/// copy .zattrs from input to output dir if it exists,
+/// and write .zarray to output dir
 fn write_metadata(
     top_dir: &Path,
     rel_in_dir: &Path,
@@ -197,7 +223,6 @@ fn write_metadata(
 
         let metadata = &mut top_json["metadata"];
         let out_zarray_str: &str = &out_zarray.to_string_lossy();
-        // NOTE: No check if metadata contains zarray key of input
         metadata[out_zarray_str] = out_data.clone();
 
         let in_zattrs_str: &str = &in_zattrs.to_string_lossy();
@@ -225,10 +250,23 @@ fn write_metadata(
     Ok(())
 }
 
-fn collect_chunks(chunks_dir: &Path, shape: usize) -> Result<Vec<PathBuf>> {
-    // TODO: Return Path or PathBuf?
-    let chunks_dir_str = chunks_dir.to_string_lossy().to_string();
-    let mut chunks = fs::read_dir(chunks_dir)?
+/// Collect the paths of chunk files in `chunk_dir`
+/// 
+/// An error is returned if the paths 
+/// do not form a sequence of mergeable indices,
+/// or if there are too many chunk files for 
+/// an array of length `shape`.
+/// Otherwise the paths are returned in the order
+/// that their respective chunks should be merged in.
+fn collect_chunk_paths(chunks_dir: &Path, shape: usize) -> Result<Vec<PathBuf>> {
+    let err_map = |_: Error| {
+        RechunkingError::IoError(format!(
+            "Directory at {} could not be read",
+            chunks_dir.to_string_lossy()
+        ))
+    };
+    let mut chunks = fs::read_dir(chunks_dir)
+        .map_err(err_map)?
         .filter_map(|entry| {
             let path = entry.ok()?.path();
             let idx = path
@@ -245,6 +283,7 @@ fn collect_chunks(chunks_dir: &Path, shape: usize) -> Result<Vec<PathBuf>> {
         .collect::<Vec<(usize, PathBuf)>>();
 
     let num_chunks = chunks.len();
+    let chunks_dir_str = chunks_dir.to_string_lossy().to_string();
     if num_chunks == 0 {
         return Err(
             RechunkingError::InvalidChunkFiles(chunks_dir_str, "no chunk files found").into(),
@@ -274,6 +313,9 @@ fn collect_chunks(chunks_dir: &Path, shape: usize) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// Concatenate the chunks at the given `paths`
+/// 
+/// Decompress if `is_compressed` is true
 fn concat_chunks(paths: Vec<PathBuf>, is_compressed: bool) -> Result<Vec<u8>> {
     let decompressor = if is_compressed {
         |b: Vec<u8>| Ok::<Vec<u8>, ()>(unsafe { blosc::decompress_bytes::<u8>(&b[..])? })
@@ -291,9 +333,17 @@ fn concat_chunks(paths: Vec<PathBuf>, is_compressed: bool) -> Result<Vec<u8>> {
     Ok(buffers.into_par_iter().flatten().collect())
 }
 
+/// Write `arr_buf` as single chunk in `out_path`
+/// 
+/// Always compresses chunk
 fn write_chunk(out_path: &Path, arr_buf: Vec<u8>) -> Result<()> {
-    // TODO: Handle errors (out_path exist, cannot be created)
-    fs::create_dir(out_path).map_err(RechunkingError::IoError)?;
+    let err_map = |_: Error| {
+        RechunkingError::IoError(format!(
+            "output directory at {} could not be created",
+            out_path.to_string_lossy()
+        ))
+    };
+    fs::create_dir(out_path).map_err(err_map)?;
 
     // TODO: Check why compression has practically no effect on merged chunk filesize
     let compressed = COMPRESSION_CONTEXT.compress(&arr_buf[..]);
@@ -301,33 +351,53 @@ fn write_chunk(out_path: &Path, arr_buf: Vec<u8>) -> Result<()> {
     Ok(fs::write(out_path.join("0"), compressed)?)
 }
 
-fn is_normal_comp(path: &Path) -> bool {
+/// Returns true iff `path` consists of a single normal component
+fn is_single_subpath(path: &Path) -> bool {
     let comps: Vec<Component> = path.components().collect();
     comps.len() == 1 && comps.iter().all(|c| matches!(c, Component::Normal { .. }))
+}
+
+/// Returns true iff `path` consists of normal components only
+fn is_subpath(path: &Path) -> bool {
+    let comps: Vec<Component> = path.components().collect();
+    !comps.is_empty()
+        && comps[0..]
+            .iter()
+            .all(|c| matches!(c, Component::Normal { .. }))
 }
 
 fn main() -> Result<()> {
     // TODO: Documentation:
     // * functions
-    // * cli parameters
-    // * help message
     // * README.md
     let args = Args::parse();
+
     let top_dir = Path::new(&args.top);
     if !top_dir.is_dir() {
         return Err(RechunkingError::InvalidArgError("<TOP> must be an existing dir.").into());
     }
-    // TODO: Check that rel_in_dir has only normal components and separators (no root, ..)
+
     let rel_in_dir = Path::new(&args.array);
+    if !is_subpath(rel_in_dir) {
+        return Err(RechunkingError::InvalidArgError(
+            "<ARRAY> must be a subpath (no root, parent, current dir components)",
+        )
+        .into());
+    }
     let in_dir = top_dir.join(rel_in_dir);
     if !in_dir.is_dir() {
         return Err(
             RechunkingError::InvalidArgError("<TOP>/<ARRAY> must be an existing dir").into(),
         );
     }
+
     let out_comp = Path::new(&args.output);
-    if !is_normal_comp(out_comp) {
-        return Err(RechunkingError::InvalidArgError("<OUTPUT> must be a single component").into());
+    if !is_single_subpath(out_comp) {
+        return Err(RechunkingError::InvalidArgError(
+            "<OUTPUT> must be a subpath (no root, parent, current dir components)
+             consisting of a single component",
+        )
+        .into());
     }
     let rel_out_dir = rel_in_dir.parent().unwrap().join(out_comp);
     let out_dir = top_dir.join(rel_out_dir.clone());
@@ -337,8 +407,9 @@ fn main() -> Result<()> {
         )
         .into());
     }
+
     let metadata = parse_zarray(&in_dir)?;
-    let chunks = collect_chunks(&in_dir, metadata.shape)?;
+    let chunks = collect_chunk_paths(&in_dir, metadata.shape)?;
     let num_chunks = chunks.len();
     write_chunk(&out_dir, concat_chunks(chunks, metadata.is_compressed)?)?;
     write_metadata(
