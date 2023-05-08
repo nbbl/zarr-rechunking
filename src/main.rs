@@ -5,6 +5,7 @@ use json::JsonValue::Null;
 use json::{object, JsonValue};
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
+use std::fmt::Debug;
 use std::fs::{self, OpenOptions};
 use std::io::{Error, Write};
 use std::path::{Component, Path, PathBuf};
@@ -28,6 +29,23 @@ struct Args {
     /// Output will be created under parent of <TOP>/<ARRAY>
     #[arg(short, long, verbatim_doc_comment)]
     output: String,
+
+    /// Compression to use for output chunk,
+    #[arg(short, long)]
+    #[clap(value_enum, default_value = "none")]
+    compression: CompressionArg,
+}
+
+#[derive(clap::ValueEnum, Debug, PartialEq, Clone)]
+#[clap(rename_all = "lower")]
+enum CompressionArg {
+    BloscLZ,
+    LZ4,
+    LZ4HC,
+    Snappy,
+    Zlib,
+    Zstd,
+    None,
 }
 
 #[derive(Error, Debug)]
@@ -61,24 +79,8 @@ struct Metadata {
     is_compressed: bool,
 }
 
-/// Compression context for compression of result chunk
-/// 
-/// corresponds to COMPRESSION_OPTIONS
-static COMPRESSION_CONTEXT: Lazy<Context> = Lazy::new(|| {
-    Context::new()
-        // Automatic determination of block size
-        .blocksize(None)
-        // Name of compression algorithm
-        .compressor(Compressor::LZ4)
-        .unwrap()
-        // Compression level
-        .clevel(Clevel::L5)
-        // Shuffle (filtering) mode
-        .shuffle(ShuffleMode::Byte)
-});
-
 /// JSON object representing the used compression options in the result .zarray
-/// 
+///
 /// corresponds to COMPRESSION_CONTEXT
 static COMPRESSION_OPTIONS: Lazy<JsonValue> = Lazy::new(|| {
     object! {
@@ -86,8 +88,6 @@ static COMPRESSION_OPTIONS: Lazy<JsonValue> = Lazy::new(|| {
         blocksize: 0,
         // Compression level
         clevel: 5,
-        // Name of compression algorithm
-        cname: "lz4",
         // Name of primary compressor (wrapper)
         id: "blosc",
         // Shuffle (filtering) mode, is byte shuffle
@@ -188,10 +188,19 @@ fn parse_zarray(in_dir: &Path) -> Result<Metadata> {
 }
 
 /// Adjust the JSON for the output .zarray
-fn adjust_zarray(in_data: JsonValue, chunk_size: usize) -> JsonValue {
+fn adjust_zarray(in_data: JsonValue, chunk_size: usize, compression: &CompressionArg) -> JsonValue {
     let mut out = in_data;
     out["chunks"] = json::array![chunk_size];
-    out["compressor"] = COMPRESSION_OPTIONS.clone();
+
+    let compressor = match &compression {
+        CompressionArg::None => json::Null,
+        _ => {
+            let mut c = COMPRESSION_OPTIONS.clone();
+            c["cname"] = json::from(format!("{:?}", &compression).to_lowercase());
+            c
+        }
+    };
+    out["compressor"] = compressor;
     out
 }
 
@@ -231,7 +240,6 @@ fn write_metadata(
             metadata[out_zattrs_str] = metadata[in_zattrs_str].clone();
         }
 
-        // TODO: Why does fs::write not always overwrite as documented?
         let mut f = OpenOptions::new()
             .write(true)
             .truncate(true)
@@ -251,10 +259,10 @@ fn write_metadata(
 }
 
 /// Collect the paths of chunk files in `chunk_dir`
-/// 
-/// An error is returned if the paths 
+///
+/// An error is returned if the paths
 /// do not form a sequence of mergeable indices,
-/// or if there are too many chunk files for 
+/// or if there are too many chunk files for
 /// an array of length `shape`.
 /// Otherwise the paths are returned in the order
 /// that their respective chunks should be merged in.
@@ -314,7 +322,7 @@ fn collect_chunk_paths(chunks_dir: &Path, shape: usize) -> Result<Vec<PathBuf>> 
 }
 
 /// Concatenate the chunks at the given `paths`
-/// 
+///
 /// Decompress if `is_compressed` is true
 fn concat_chunks(paths: Vec<PathBuf>, is_compressed: bool) -> Result<Vec<u8>> {
     let decompressor = if is_compressed {
@@ -333,10 +341,34 @@ fn concat_chunks(paths: Vec<PathBuf>, is_compressed: bool) -> Result<Vec<u8>> {
     Ok(buffers.into_par_iter().flatten().collect())
 }
 
+/// Creates a compression context based on `arg`
+fn make_compression_ctx(arg: &CompressionArg) -> Option<Context> {
+    match arg {
+        CompressionArg::BloscLZ => Some(Compressor::BloscLZ),
+        CompressionArg::LZ4 => Some(Compressor::LZ4),
+        CompressionArg::LZ4HC => Some(Compressor::LZ4HC),
+        CompressionArg::Snappy => Some(Compressor::Snappy),
+        CompressionArg::Zlib => Some(Compressor::Zlib),
+        CompressionArg::Zstd => Some(Compressor::Zstd),
+        CompressionArg::None => None,
+    }
+    .map(|compressor| {
+        Context::new()
+            // Automatic determination of block size
+            .blocksize(None)
+            // Compression algorithm
+            .compressor(compressor)
+            .unwrap()
+            // Compression level
+            .clevel(Clevel::L5)
+            // Shuffle (filtering) mode
+            .shuffle(ShuffleMode::Byte)
+    })
+}
+
 /// Write `arr_buf` as single chunk in `out_path`
-/// 
-/// Always compresses chunk
-fn write_chunk(out_path: &Path, arr_buf: Vec<u8>) -> Result<()> {
+/// uses compression of type `compressor` for output
+fn write_chunk(out_path: &Path, arr_buf: Vec<u8>, compressor: &CompressionArg) -> Result<()> {
     let err_map = |_: Error| {
         RechunkingError::IoError(format!(
             "output directory at {} could not be created",
@@ -345,9 +377,12 @@ fn write_chunk(out_path: &Path, arr_buf: Vec<u8>) -> Result<()> {
     };
     fs::create_dir(out_path).map_err(err_map)?;
 
-    // TODO: Check why compression has practically no effect on merged chunk filesize
-    let compressed = COMPRESSION_CONTEXT.compress(&arr_buf[..]);
+    let compression_ctx = make_compression_ctx(compressor);
+    if compression_ctx.is_none() {
+        return Ok(fs::write(out_path.join("0"), arr_buf)?);
+    }
 
+    let compressed = compression_ctx.unwrap().compress(&arr_buf[..]);
     Ok(fs::write(out_path.join("0"), compressed)?)
 }
 
@@ -368,8 +403,8 @@ fn is_subpath(path: &Path) -> bool {
 
 fn main() -> Result<()> {
     // TODO: Documentation:
-    // * functions
     // * README.md
+
     let args = Args::parse();
 
     let top_dir = Path::new(&args.top);
@@ -411,12 +446,16 @@ fn main() -> Result<()> {
     let metadata = parse_zarray(&in_dir)?;
     let chunks = collect_chunk_paths(&in_dir, metadata.shape)?;
     let num_chunks = chunks.len();
-    write_chunk(&out_dir, concat_chunks(chunks, metadata.is_compressed)?)?;
+    write_chunk(
+        &out_dir,
+        concat_chunks(chunks, metadata.is_compressed)?,
+        &args.compression,
+    )?;
     write_metadata(
         top_dir,
         rel_in_dir,
         &rel_out_dir,
-        adjust_zarray(metadata.json, num_chunks),
+        adjust_zarray(metadata.json, num_chunks, &args.compression),
     )?;
     Ok(())
 }
