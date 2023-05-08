@@ -30,7 +30,7 @@ struct Args {
     #[arg(short, long, verbatim_doc_comment)]
     output: String,
 
-    /// Compression to use for output chunk,
+    /// Blosc internal compression algorithm for output chunk
     #[arg(short, long)]
     #[clap(value_enum, default_value = "none")]
     compression: CompressionArg,
@@ -100,7 +100,8 @@ static COMPRESSION_OPTIONS: Lazy<JsonValue> = Lazy::new(|| {
 /// An error is returned if the file cannot be read,
 /// JSON is not valid,
 /// or metadata is incompatible with rechunking
-/// Note that compressor options are not checked in detail!
+/// Note that compressor options are not checked in detail.
+/// It is only checked that a Blosc compressor was used!
 fn parse_zarray(in_dir: &Path) -> Result<Metadata> {
     let zarray_file = in_dir.join(".zarray");
     let zarray_file_str = zarray_file.to_string_lossy().to_string();
