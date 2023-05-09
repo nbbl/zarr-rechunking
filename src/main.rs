@@ -81,7 +81,7 @@ struct Metadata {
 
 /// JSON object representing the used compression options in the result .zarray
 ///
-/// corresponds to COMPRESSION_CONTEXT
+/// cname (= name of internal compressor) is missing as it is set dynamically
 static COMPRESSION_OPTIONS: Lazy<JsonValue> = Lazy::new(|| {
     object! {
         // Automatic determination of block size
